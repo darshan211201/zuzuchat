@@ -1,9 +1,10 @@
 "use client"
 
+
 import { useEffect, useRef, useState } from "react"
 import { supabase } from "@/lib/supabase"
 import VideoCall from "@/components/video-call"
-import EmojiPicker from "emoji-picker-react"
+import EmojiPicker, { Theme } from "emoji-picker-react"
 import ProfileAvatar from "@/components/profile-avatar"
 import ImageUpload from "@/components/image-upload"
 import { encryptMessage, decryptMessage } from "@/lib/encryption"
@@ -46,14 +47,14 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       await supabase
         .from("profiles")
         .update({ is_online: true, is_typing: false })
-        .eq("id", profile.id)
+        .eq("id", profile!.id)
     }
 
     async function goOffline() {
       await supabase
         .from("profiles")
         .update({ is_online: false, is_typing: false })
-        .eq("id", profile.id)
+        .eq("id", profile!.id)
     }
 
     goOnline()
@@ -450,7 +451,7 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
                     onEmojiClick={(emojiData) =>
                       setNewMessage((prev) => prev + emojiData.emoji)
                     }
-                    theme="dark"
+                    theme={Theme.DARK}
                   />
                 </div>
               )}
