@@ -139,10 +139,30 @@ export default function VideoCall({
       }
     }
 
-    peer.ontrack = (event) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = event.streams[0]
-        remoteVideoRef.current.play().catch(() => {})
+    peer.onconnectionstatechange = () => {
+      console.log("Connection state:", peer.connectionState)
+    }
+
+    peer.oniceconnectionstatechange = () => {
+      console.log("ICE state:", peer.iceConnectionState)
+    }
+
+    peer.ontrack = async (event) => {
+      console.log("Remote track received", event.streams)
+
+      const remoteStream = event.streams[0]
+
+      if (remoteVideoRef.current && remoteStream) {
+        remoteVideoRef.current.srcObject = remoteStream
+
+        remoteVideoRef.current.onloadedmetadata = async () => {
+          try {
+            await remoteVideoRef.current?.play()
+            console.log("Remote video playing")
+          } catch (err) {
+            console.error("Remote play error", err)
+          }
+        }
       }
     }
 
@@ -398,6 +418,12 @@ export default function VideoCall({
                 </div>
               )}
 
+              {audioOnly && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-950 text-white text-xl font-semibold">
+                  Audio Call
+                </div>
+              )}
+
               <div className="absolute bottom-3 left-3 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
                 You
               </div>
@@ -411,13 +437,19 @@ export default function VideoCall({
                 className="w-full h-full bg-slate-900 object-cover"
               />
 
+              {audioOnly && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-950 text-white text-xl font-semibold">
+                  Friend Audio
+                </div>
+              )}
+
               <div className="absolute bottom-3 left-3 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
                 Friend
               </div>
             </div>
           </div>
 
-          <div className="p-5 flex justify-center gap-3 bg-black">
+          <div className="p-5 flex flex-wrap justify-center gap-3 bg-black">
             <button
               onClick={toggleMic}
               className={`px-6 py-3 rounded-full font-semibold text-white ${

@@ -7,6 +7,7 @@ import EmojiPicker, { Theme } from "emoji-picker-react"
 import ProfileAvatar from "@/components/profile-avatar"
 import ImageUpload from "@/components/image-upload"
 import { encryptMessage, decryptMessage } from "@/lib/encryption"
+import VoiceRecorder from "@/components/voice-recorder"
 
 type Profile = {
   id: string
@@ -23,8 +24,10 @@ type Message = {
   receiver_id: string
   message: string | null
   image_url?: string | null
+  audio_url?: string | null
   created_at: string
   is_seen?: boolean
+  is_deleted?: boolean
 }
 
 export default function ChatClient({ profile }: { profile: Profile | null }) {
@@ -35,6 +38,7 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [newMessage, setNewMessage] = useState("")
   const [showEmoji, setShowEmoji] = useState(false)
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null)
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -93,8 +97,10 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
           if (!msg) return
 
           const isThisChat =
-            (msg.sender_id === profile.id && msg.receiver_id === selectedFriend.id) ||
-            (msg.sender_id === selectedFriend.id && msg.receiver_id === profile.id)
+            (msg.sender_id === profile.id &&
+              msg.receiver_id === selectedFriend.id) ||
+            (msg.sender_id === selectedFriend.id &&
+              msg.receiver_id === profile.id)
 
           if (isThisChat) {
             loadMessages()
@@ -238,7 +244,9 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       receiver_id: selectedFriend.id,
       message: encryptMessage(newMessage.trim()),
       image_url: null,
+      audio_url: null,
       is_seen: false,
+      is_deleted: false,
     })
 
     setNewMessage("")
@@ -253,20 +261,65 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       receiver_id: selectedFriend.id,
       message: "",
       image_url: imageUrl,
+      audio_url: null,
       is_seen: false,
+      is_deleted: false,
     })
   }
 
+  async function sendAudio(audioUrl: string) {
+    if (!profile || !selectedFriend) return
+
+    await supabase.from("messages").insert({
+      sender_id: profile.id,
+      receiver_id: selectedFriend.id,
+      message: "",
+      image_url: null,
+      audio_url: audioUrl,
+      is_seen: false,
+      is_deleted: false,
+    })
+  }
+
+  async function deleteMessage(msg: Message) {
+    if (!profile || msg.sender_id !== profile.id) return
+
+    const confirmDelete = confirm("Delete this message for everyone?")
+    if (!confirmDelete) return
+
+    await supabase
+      .from("messages")
+      .update({
+        is_deleted: true,
+        message: "",
+        image_url: null,
+        audio_url: null,
+      })
+      .eq("id", msg.id)
+
+    setOpenMenuId(null)
+  }
+
   function displayMessage(msg: Message) {
+    if (msg.is_deleted) return "This message was deleted"
     if (!msg.message) return ""
-    return decryptMessage(msg.message)
+
+    try {
+      return decryptMessage(msg.message)
+    } catch {
+      return msg.message
+    }
   }
 
   function renderTicks(msg: Message) {
-    if (msg.sender_id !== profile?.id) return null
+    if (msg.sender_id !== profile?.id || msg.is_deleted) return null
 
     return (
-      <span className={`ml-2 text-xs ${msg.is_seen ? "text-blue-300" : "text-slate-300"}`}>
+      <span
+        className={`ml-2 text-xs ${
+          msg.is_seen ? "text-blue-300" : "text-slate-300"
+        }`}
+      >
         {msg.is_seen ? "✓✓" : "✓"}
       </span>
     )
@@ -408,8 +461,15 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
               </div>
 
               <div className="flex gap-2 md:gap-3">
-                <VideoCall profile={profile} selectedFriend={selectedFriend} audioOnly />
-                <VideoCall profile={profile} selectedFriend={selectedFriend} />
+                <VideoCall
+                  profile={profile}
+                  selectedFriend={selectedFriend}
+                  audioOnly
+                />
+                <VideoCall
+                  profile={profile}
+                  selectedFriend={selectedFriend}
+                />
               </div>
             </div>
 
@@ -417,16 +477,46 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
               {messages.map((msg) => (
                 <div
                   key={msg.id}
-                  className={`flex ${
-                    msg.sender_id === profile?.id ? "justify-end" : "justify-start"
+                  className={`group flex gap-2 ${
+                    msg.sender_id === profile?.id
+                      ? "justify-end"
+                      : "justify-start"
                   }`}
                 >
+                  {msg.sender_id === profile?.id && !msg.is_deleted && (
+                    <div className="relative">
+                      <button
+                        onClick={() =>
+                          setOpenMenuId(openMenuId === msg.id ? null : msg.id)
+                        }
+                        className="text-slate-400 hover:text-white px-2 py-1 rounded-lg bg-slate-900"
+                      >
+                        ⋮
+                      </button>
+
+                      {openMenuId === msg.id && (
+                        <div className="absolute right-0 top-8 bg-slate-900 border border-slate-700 rounded-xl shadow-xl z-50 min-w-32">
+                          <button
+                            onClick={() => deleteMessage(msg)}
+                            className="w-full text-left px-4 py-3 text-red-400 hover:bg-slate-800 rounded-xl"
+                          >
+                            🗑 Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div
-                    className={`px-4 py-3 rounded-2xl max-w-[80%] md:max-w-md ${
-                      msg.sender_id === profile?.id ? "bg-blue-700" : "bg-slate-800"
+                    className={`px-4 py-3 rounded-2xl max-w-[80%] ${
+                      msg.is_deleted
+                        ? "bg-slate-900 text-slate-500 italic border border-slate-800"
+                        : msg.sender_id === profile?.id
+                        ? "bg-blue-700"
+                        : "bg-slate-800"
                     }`}
                   >
-                    {msg.image_url && (
+                    {msg.image_url && !msg.is_deleted && (
                       <img
                         src={msg.image_url}
                         alt="chat image"
@@ -434,7 +524,11 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
                       />
                     )}
 
-                    {msg.message && <p className="break-words">{displayMessage(msg)}</p>}
+                    {msg.audio_url && !msg.is_deleted && (
+                      <audio controls src={msg.audio_url} className="mb-2 w-full" />
+                    )}
+
+                    <p className="break-words">{displayMessage(msg)}</p>
 
                     <div className="flex justify-end">{renderTicks(msg)}</div>
                   </div>
@@ -467,6 +561,12 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
                 profile={profile}
                 selectedFriend={selectedFriend}
                 onUploaded={sendImage}
+              />
+
+              <VoiceRecorder
+                profile={profile}
+                selectedFriend={selectedFriend}
+                onUploaded={sendAudio}
               />
 
               <input
