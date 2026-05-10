@@ -38,6 +38,8 @@ export default function VideoCall({
   const [call, setCall] = useState<Call | null>(null)
   const [incomingCall, setIncomingCall] = useState<Call | null>(null)
   const [inCall, setInCall] = useState(false)
+  const [micMuted, setMicMuted] = useState(false)
+  const [videoOff, setVideoOff] = useState(false)
 
   useEffect(() => {
     ringtoneRef.current = new Audio("/ringtone.mp3")
@@ -65,11 +67,9 @@ export default function VideoCall({
 
           setIncomingCall(newCall)
 
-          ringtoneRef.current
-            ?.play()
-            .catch(() => {
-              console.log("Ringtone blocked until user interacts with page")
-            })
+          ringtoneRef.current?.play().catch(() => {
+            console.log("Ringtone blocked until user interacts with page")
+          })
         }
       )
       .subscribe()
@@ -81,14 +81,52 @@ export default function VideoCall({
 
   function stopRingtone() {
     if (!ringtoneRef.current) return
-
     ringtoneRef.current.pause()
     ringtoneRef.current.currentTime = 0
   }
 
+  function toggleMic() {
+    const stream = localStreamRef.current
+    if (!stream) return
+
+    const audioTrack = stream.getAudioTracks()[0]
+    if (!audioTrack) return
+
+    audioTrack.enabled = !audioTrack.enabled
+    setMicMuted(!audioTrack.enabled)
+  }
+
+  function toggleVideo() {
+    const stream = localStreamRef.current
+    if (!stream) return
+
+    const videoTrack = stream.getVideoTracks()[0]
+    if (!videoTrack) return
+
+    videoTrack.enabled = !videoTrack.enabled
+    setVideoOff(!videoTrack.enabled)
+  }
+
   async function createPeerConnection(callId: string, onlyAudio: boolean) {
     const peer = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        {
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turns:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+      ],
     })
 
     peer.onicecandidate = async (event) => {
@@ -119,6 +157,8 @@ export default function VideoCall({
     })
 
     localStreamRef.current = stream
+    setMicMuted(false)
+    setVideoOff(false)
 
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = stream
@@ -190,7 +230,7 @@ export default function VideoCall({
           }
 
           if (updatedCall.status === "ended") {
-            endCall()
+            endCall(false)
           }
         }
       )
@@ -289,10 +329,10 @@ export default function VideoCall({
     setIncomingCall(null)
   }
 
-  async function endCall() {
+  async function endCall(updateDb = true) {
     stopRingtone()
 
-    if (call) {
+    if (updateDb && call) {
       await supabase.from("calls").update({ status: "ended" }).eq("id", call.id)
     }
 
@@ -302,9 +342,16 @@ export default function VideoCall({
     localStreamRef.current?.getTracks().forEach((track) => track.stop())
     localStreamRef.current = null
 
+    pendingCandidatesRef.current = []
+
+    if (localVideoRef.current) localVideoRef.current.srcObject = null
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
+
     setCall(null)
     setIncomingCall(null)
     setInCall(false)
+    setMicMuted(false)
+    setVideoOff(false)
   }
 
   return (
@@ -336,25 +383,67 @@ export default function VideoCall({
       {inCall && (
         <div className="fixed inset-0 z-50 bg-black flex flex-col">
           <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 p-4">
-            <video
-              ref={localVideoRef}
-              autoPlay
-              muted
-              playsInline
-              className="w-full h-full bg-slate-900 rounded-2xl object-cover"
-            />
+            <div className="relative bg-slate-900 rounded-2xl overflow-hidden">
+              <video
+                ref={localVideoRef}
+                autoPlay
+                muted
+                playsInline
+                className="w-full h-full bg-slate-900 object-cover"
+              />
 
-            <video
-              ref={remoteVideoRef}
-              autoPlay
-              playsInline
-              className="w-full h-full bg-slate-900 rounded-2xl object-cover"
-            />
+              {videoOff && !audioOnly && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-950 text-white text-xl font-semibold">
+                  Camera Off
+                </div>
+              )}
+
+              <div className="absolute bottom-3 left-3 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
+                You
+              </div>
+            </div>
+
+            <div className="relative bg-slate-900 rounded-2xl overflow-hidden">
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                className="w-full h-full bg-slate-900 object-cover"
+              />
+
+              <div className="absolute bottom-3 left-3 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
+                Friend
+              </div>
+            </div>
           </div>
 
-          <div className="p-5 flex justify-center">
+          <div className="p-5 flex justify-center gap-3 bg-black">
             <button
-              onClick={endCall}
+              onClick={toggleMic}
+              className={`px-6 py-3 rounded-full font-semibold text-white ${
+                micMuted
+                  ? "bg-slate-700 hover:bg-slate-600"
+                  : "bg-blue-600 hover:bg-blue-500"
+              }`}
+            >
+              {micMuted ? "Unmute Mic" : "Mute Mic"}
+            </button>
+
+            {!audioOnly && (
+              <button
+                onClick={toggleVideo}
+                className={`px-6 py-3 rounded-full font-semibold text-white ${
+                  videoOff
+                    ? "bg-slate-700 hover:bg-slate-600"
+                    : "bg-purple-600 hover:bg-purple-500"
+                }`}
+              >
+                {videoOff ? "Video On" : "Video Off"}
+              </button>
+            )}
+
+            <button
+              onClick={() => endCall(true)}
               className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full font-semibold"
             >
               End Call
