@@ -32,6 +32,7 @@ export default function VideoCall({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
   const peerRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
+  const remoteStreamRef = useRef<MediaStream | null>(null)
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([])
   const ringtoneRef = useRef<HTMLAudioElement | null>(null)
 
@@ -40,6 +41,7 @@ export default function VideoCall({
   const [inCall, setInCall] = useState(false)
   const [micMuted, setMicMuted] = useState(false)
   const [videoOff, setVideoOff] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState("Waiting...")
 
   useEffect(() => {
     ringtoneRef.current = new Audio("/ringtone.mp3")
@@ -50,7 +52,7 @@ export default function VideoCall({
     if (!profile) return
 
     const channel = supabase
-      .channel(`calls-listener-${profile.id}-${audioOnly ? "audio" : "video"}`)
+      .channel(`incoming-${profile.id}-${audioOnly ? "audio" : "video"}`)
       .on(
         "postgres_changes",
         {
@@ -68,7 +70,7 @@ export default function VideoCall({
           setIncomingCall(newCall)
 
           ringtoneRef.current?.play().catch(() => {
-            console.log("Ringtone blocked until user interacts with page")
+            console.log("Ringtone blocked until page interaction")
           })
         }
       )
@@ -86,10 +88,7 @@ export default function VideoCall({
   }
 
   function toggleMic() {
-    const stream = localStreamRef.current
-    if (!stream) return
-
-    const audioTrack = stream.getAudioTracks()[0]
+    const audioTrack = localStreamRef.current?.getAudioTracks()[0]
     if (!audioTrack) return
 
     audioTrack.enabled = !audioTrack.enabled
@@ -97,14 +96,28 @@ export default function VideoCall({
   }
 
   function toggleVideo() {
-    const stream = localStreamRef.current
-    if (!stream) return
-
-    const videoTrack = stream.getVideoTracks()[0]
+    const videoTrack = localStreamRef.current?.getVideoTracks()[0]
     if (!videoTrack) return
 
     videoTrack.enabled = !videoTrack.enabled
     setVideoOff(!videoTrack.enabled)
+  }
+
+  async function attachRemoteStream(stream: MediaStream) {
+    remoteStreamRef.current = stream
+
+    if (!remoteVideoRef.current) return
+
+    remoteVideoRef.current.srcObject = stream
+    remoteVideoRef.current.muted = false
+    remoteVideoRef.current.volume = 1
+
+    try {
+      await remoteVideoRef.current.play()
+      console.log("Remote video started")
+    } catch (err) {
+      console.log("Remote autoplay blocked, user interaction may be needed", err)
+    }
   }
 
   async function createPeerConnection(callId: string, onlyAudio: boolean) {
@@ -127,53 +140,67 @@ export default function VideoCall({
           credential: "openrelayproject",
         },
       ],
+      iceCandidatePoolSize: 10,
     })
 
+    peerRef.current = peer
+
     peer.onicecandidate = async (event) => {
-      if (event.candidate && profile) {
-        await supabase.from("call_ice_candidates").insert({
-          call_id: callId,
-          sender_id: profile.id,
-          candidate: JSON.stringify(event.candidate),
-        })
+      if (!event.candidate || !profile) return
+
+      await supabase.from("call_ice_candidates").insert({
+        call_id: callId,
+        sender_id: profile.id,
+        candidate: JSON.stringify(event.candidate),
+      })
+    }
+
+    peer.ontrack = async (event) => {
+      console.log("Remote track received:", event.track.kind)
+
+      let remoteStream = event.streams[0]
+
+      if (!remoteStream) {
+        remoteStream = remoteStreamRef.current || new MediaStream()
+        remoteStream.addTrack(event.track)
       }
+
+      await attachRemoteStream(remoteStream)
     }
 
     peer.onconnectionstatechange = () => {
       console.log("Connection state:", peer.connectionState)
+      setConnectionStatus(peer.connectionState)
+
+      if (
+        peer.connectionState === "failed" ||
+        peer.connectionState === "disconnected"
+      ) {
+        console.log("Connection problem detected")
+      }
     }
 
     peer.oniceconnectionstatechange = () => {
       console.log("ICE state:", peer.iceConnectionState)
     }
 
-    peer.ontrack = async (event) => {
-      console.log("Remote track received", event.streams)
-
-      const remoteStream = event.streams[0]
-
-      if (remoteVideoRef.current && remoteStream) {
-        remoteVideoRef.current.srcObject = remoteStream
-
-        remoteVideoRef.current.onloadedmetadata = async () => {
-          try {
-            await remoteVideoRef.current?.play()
-            console.log("Remote video playing")
-          } catch (err) {
-            console.error("Remote play error", err)
-          }
-        }
-      }
-    }
-
     if (!navigator.mediaDevices?.getUserMedia) {
-      alert("Camera/mic works only on localhost or HTTPS")
+      alert("Camera/microphone works only on HTTPS or localhost")
       throw new Error("getUserMedia not supported")
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: !onlyAudio,
-      audio: true,
+      video: onlyAudio
+        ? false
+        : {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: "user",
+          },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
     })
 
     localStreamRef.current = stream
@@ -182,29 +209,34 @@ export default function VideoCall({
 
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = stream
-      localVideoRef.current.play().catch(() => {})
+      localVideoRef.current.muted = true
+      await localVideoRef.current.play().catch(() => {})
     }
 
     stream.getTracks().forEach((track) => {
       peer.addTrack(track, stream)
     })
 
-    peerRef.current = peer
     return peer
   }
 
   async function flushPendingCandidates() {
-    if (!peerRef.current?.remoteDescription) return
+    const peer = peerRef.current
+    if (!peer?.remoteDescription) return
 
     for (const candidate of pendingCandidatesRef.current) {
-      await peerRef.current.addIceCandidate(candidate)
+      try {
+        await peer.addIceCandidate(candidate)
+      } catch (err) {
+        console.log("ICE candidate failed:", err)
+      }
     }
 
     pendingCandidatesRef.current = []
   }
 
   function listenForIceCandidates(callId: string) {
-    supabase
+    return supabase
       .channel(`ice-${callId}-${profile?.id}-${audioOnly ? "audio" : "video"}`)
       .on(
         "postgres_changes",
@@ -216,12 +248,17 @@ export default function VideoCall({
         },
         async (payload) => {
           const row = payload.new as any
+
           if (row.sender_id === profile?.id) return
 
           const candidate = JSON.parse(row.candidate)
 
           if (peerRef.current?.remoteDescription) {
-            await peerRef.current.addIceCandidate(candidate)
+            try {
+              await peerRef.current.addIceCandidate(candidate)
+            } catch (err) {
+              console.log("Add ICE failed:", err)
+            }
           } else {
             pendingCandidatesRef.current.push(candidate)
           }
@@ -231,7 +268,7 @@ export default function VideoCall({
   }
 
   function listenForAnswer(callId: string, peer: RTCPeerConnection) {
-    supabase
+    return supabase
       .channel(`answer-${callId}-${audioOnly ? "audio" : "video"}`)
       .on(
         "postgres_changes",
@@ -249,7 +286,10 @@ export default function VideoCall({
             await flushPendingCandidates()
           }
 
-          if (updatedCall.status === "ended") {
+          if (
+            updatedCall.status === "ended" ||
+            updatedCall.status === "declined"
+          ) {
             endCall(false)
           }
         }
@@ -262,6 +302,8 @@ export default function VideoCall({
       alert("Select a friend first")
       return
     }
+
+    setConnectionStatus("Calling...")
 
     const { data: callRow, error } = await supabase
       .from("calls")
@@ -285,7 +327,11 @@ export default function VideoCall({
     const peer = await createPeerConnection(callRow.id, audioOnly)
     listenForIceCandidates(callRow.id)
 
-    const offer = await peer.createOffer()
+    const offer = await peer.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: !audioOnly,
+    })
+
     await peer.setLocalDescription(offer)
 
     await supabase
@@ -300,6 +346,7 @@ export default function VideoCall({
     if (!profile || !incomingCall) return
 
     stopRingtone()
+    setConnectionStatus("Connecting...")
 
     const { data: freshCall } = await supabase
       .from("calls")
@@ -312,10 +359,11 @@ export default function VideoCall({
       return
     }
 
+    const onlyAudio = freshCall.call_type === "audio"
+
     setCall(freshCall)
     setInCall(true)
 
-    const onlyAudio = freshCall.call_type === "audio"
     const peer = await createPeerConnection(freshCall.id, onlyAudio)
     listenForIceCandidates(freshCall.id)
 
@@ -362,6 +410,9 @@ export default function VideoCall({
     localStreamRef.current?.getTracks().forEach((track) => track.stop())
     localStreamRef.current = null
 
+    remoteStreamRef.current?.getTracks().forEach((track) => track.stop())
+    remoteStreamRef.current = null
+
     pendingCandidatesRef.current = []
 
     if (localVideoRef.current) localVideoRef.current.srcObject = null
@@ -372,15 +423,18 @@ export default function VideoCall({
     setInCall(false)
     setMicMuted(false)
     setVideoOff(false)
+    setConnectionStatus("Waiting...")
   }
 
   return (
     <>
       {incomingCall && !inCall && (
         <div className="fixed top-5 right-5 z-50 bg-slate-900 border border-blue-800 rounded-2xl p-4 shadow-2xl">
-          <p className="text-white font-semibold mb-3">
+          <p className="text-white font-semibold mb-1">
             Incoming {incomingCall.call_type === "audio" ? "audio" : "video"} call
           </p>
+
+          <p className="text-slate-400 text-sm mb-3">Tap accept to connect</p>
 
           <div className="flex gap-2">
             <button
@@ -434,12 +488,19 @@ export default function VideoCall({
                 ref={remoteVideoRef}
                 autoPlay
                 playsInline
+                controls={false}
                 className="w-full h-full bg-slate-900 object-cover"
               />
 
               {audioOnly && (
                 <div className="absolute inset-0 flex items-center justify-center bg-slate-950 text-white text-xl font-semibold">
                   Friend Audio
+                </div>
+              )}
+
+              {!audioOnly && (
+                <div className="absolute top-3 right-3 bg-black/60 text-white px-3 py-1 rounded-full text-xs">
+                  {connectionStatus}
                 </div>
               )}
 
@@ -473,6 +534,15 @@ export default function VideoCall({
                 {videoOff ? "Video On" : "Video Off"}
               </button>
             )}
+
+            <button
+              onClick={() => {
+                remoteVideoRef.current?.play().catch(() => {})
+              }}
+              className="bg-slate-700 hover:bg-slate-600 text-white px-6 py-3 rounded-full font-semibold"
+            >
+              Play Video
+            </button>
 
             <button
               onClick={() => endCall(true)}
