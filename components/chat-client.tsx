@@ -6,8 +6,8 @@ import VideoCall from "@/components/video-call"
 import EmojiPicker, { Theme } from "emoji-picker-react"
 import ProfileAvatar from "@/components/profile-avatar"
 import ImageUpload from "@/components/image-upload"
-import { encryptMessage, decryptMessage } from "@/lib/encryption"
 import VoiceRecorder from "@/components/voice-recorder"
+import { encryptMessage, decryptMessage } from "@/lib/encryption"
 
 type Profile = {
   id: string
@@ -25,10 +25,24 @@ type Message = {
   message: string | null
   image_url?: string | null
   audio_url?: string | null
+  file_url?: string | null
+  file_name?: string | null
+  file_type?: string | null
+  reply_to_id?: string | null
+  is_edited?: boolean
+  edited_at?: string | null
   created_at: string
   is_seen?: boolean
   is_deleted?: boolean
 }
+
+const wallpapers = [
+  "from-slate-950 to-black",
+  "from-blue-950 to-black",
+  "from-purple-950 to-black",
+  "from-emerald-950 to-black",
+  "from-rose-950 to-black",
+]
 
 export default function ChatClient({ profile }: { profile: Profile | null }) {
   const [search, setSearch] = useState("")
@@ -36,12 +50,25 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
   const [friends, setFriends] = useState<Profile[]>([])
   const [selectedFriend, setSelectedFriend] = useState<Profile | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({})
   const [newMessage, setNewMessage] = useState("")
   const [showEmoji, setShowEmoji] = useState(false)
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
 
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null)
+  const [editingMsg, setEditingMsg] = useState<Message | null>(null)
+  const [wallpaper, setWallpaper] = useState(wallpapers[0])
+  const [showThemes, setShowThemes] = useState(false)
+  const [aiLoading, setAiLoading] = useState(false)
+
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    const saved = localStorage.getItem("zuzuchat_wallpaper")
+    if (saved) setWallpaper(saved)
+  }, [])
 
   useEffect(() => {
     if (!profile) return
@@ -71,11 +98,34 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
 
   useEffect(() => {
     loadFriends()
+    loadUnreadCounts()
   }, [profile])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
+
+  useEffect(() => {
+    if (!profile) return
+
+    const unreadChannel = supabase
+      .channel(`unread-${profile.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "messages",
+          filter: `receiver_id=eq.${profile.id}`,
+        },
+        () => loadUnreadCounts()
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(unreadChannel)
+    }
+  }, [profile])
 
   useEffect(() => {
     if (!profile || !selectedFriend) return
@@ -97,14 +147,13 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
           if (!msg) return
 
           const isThisChat =
-            (msg.sender_id === profile.id &&
-              msg.receiver_id === selectedFriend.id) ||
-            (msg.sender_id === selectedFriend.id &&
-              msg.receiver_id === profile.id)
+            (msg.sender_id === profile.id && msg.receiver_id === selectedFriend.id) ||
+            (msg.sender_id === selectedFriend.id && msg.receiver_id === profile.id)
 
           if (isThisChat) {
             loadMessages()
             markMessagesSeen()
+            loadUnreadCounts()
           }
         }
       )
@@ -154,6 +203,25 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       .in("id", friendIds)
 
     setFriends(friendProfiles || [])
+  }
+
+  async function loadUnreadCounts() {
+    if (!profile) return
+
+    const { data } = await supabase
+      .from("messages")
+      .select("sender_id")
+      .eq("receiver_id", profile.id)
+      .eq("is_seen", false)
+      .eq("is_deleted", false)
+
+    const counts: Record<string, number> = {}
+
+    ;(data || []).forEach((msg) => {
+      counts[msg.sender_id] = (counts[msg.sender_id] || 0) + 1
+    })
+
+    setUnreadCounts(counts)
   }
 
   async function searchUsers(value: string) {
@@ -210,6 +278,11 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       .eq("sender_id", selectedFriend.id)
       .eq("receiver_id", profile.id)
       .eq("is_seen", false)
+
+    setUnreadCounts((prev) => ({
+      ...prev,
+      [selectedFriend.id]: 0,
+    }))
   }
 
   async function setTyping(value: boolean) {
@@ -239,17 +312,39 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
 
     await setTyping(false)
 
+    if (editingMsg) {
+      await supabase
+        .from("messages")
+        .update({
+          message: encryptMessage(newMessage.trim()),
+          is_edited: true,
+          edited_at: new Date().toISOString(),
+        })
+        .eq("id", editingMsg.id)
+        .eq("sender_id", profile.id)
+
+      setEditingMsg(null)
+      setNewMessage("")
+      setShowEmoji(false)
+      return
+    }
+
     await supabase.from("messages").insert({
       sender_id: profile.id,
       receiver_id: selectedFriend.id,
       message: encryptMessage(newMessage.trim()),
       image_url: null,
       audio_url: null,
+      file_url: null,
+      file_name: null,
+      file_type: null,
+      reply_to_id: replyingTo?.id || null,
       is_seen: false,
       is_deleted: false,
     })
 
     setNewMessage("")
+    setReplyingTo(null)
     setShowEmoji(false)
   }
 
@@ -262,9 +357,15 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       message: "",
       image_url: imageUrl,
       audio_url: null,
+      file_url: null,
+      file_name: null,
+      file_type: null,
+      reply_to_id: replyingTo?.id || null,
       is_seen: false,
       is_deleted: false,
     })
+
+    setReplyingTo(null)
   }
 
   async function sendAudio(audioUrl: string) {
@@ -276,9 +377,50 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
       message: "",
       image_url: null,
       audio_url: audioUrl,
+      file_url: null,
+      file_name: null,
+      file_type: null,
+      reply_to_id: replyingTo?.id || null,
       is_seen: false,
       is_deleted: false,
     })
+
+    setReplyingTo(null)
+  }
+
+  async function sendFile(file: File) {
+    if (!profile || !selectedFriend) return
+
+    const filePath = `${profile.id}/${Date.now()}-${file.name}`
+
+    const { error } = await supabase.storage
+      .from("chat-files")
+      .upload(filePath, file)
+
+    if (error) {
+      alert("File upload failed ❌")
+      return
+    }
+
+    const { data } = supabase.storage
+      .from("chat-files")
+      .getPublicUrl(filePath)
+
+    await supabase.from("messages").insert({
+      sender_id: profile.id,
+      receiver_id: selectedFriend.id,
+      message: "",
+      image_url: null,
+      audio_url: null,
+      file_url: data.publicUrl,
+      file_name: file.name,
+      file_type: file.type,
+      reply_to_id: replyingTo?.id || null,
+      is_seen: false,
+      is_deleted: false,
+    })
+
+    setReplyingTo(null)
   }
 
   async function deleteMessage(msg: Message) {
@@ -294,32 +436,46 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
         message: "",
         image_url: null,
         audio_url: null,
+        file_url: null,
+        file_name: null,
+        file_type: null,
       })
       .eq("id", msg.id)
+  }
 
+  function startEdit(msg: Message) {
+    if (msg.sender_id !== profile?.id || msg.is_deleted) return
+    if (!msg.message) return alert("Only text messages can be edited")
+
+    setEditingMsg(msg)
+    setReplyingTo(null)
+    setNewMessage(displayMessage(msg))
+    setOpenMenuId(null)
+  }
+
+  function startReply(msg: Message) {
+    if (msg.is_deleted) return
+    setReplyingTo(msg)
+    setEditingMsg(null)
     setOpenMenuId(null)
   }
 
   function displayMessage(msg: Message) {
     if (msg.is_deleted) return "This message was deleted"
     if (!msg.message) return ""
+    return decryptMessage(msg.message)
+  }
 
-    try {
-      return decryptMessage(msg.message)
-    } catch {
-      return msg.message
-    }
+  function findReplyMessage(replyId?: string | null) {
+    if (!replyId) return null
+    return messages.find((m) => m.id === replyId) || null
   }
 
   function renderTicks(msg: Message) {
     if (msg.sender_id !== profile?.id || msg.is_deleted) return null
 
     return (
-      <span
-        className={`ml-2 text-xs ${
-          msg.is_seen ? "text-blue-300" : "text-slate-300"
-        }`}
-      >
+      <span className={`ml-2 text-xs ${msg.is_seen ? "text-blue-300" : "text-slate-300"}`}>
         {msg.is_seen ? "✓✓" : "✓"}
       </span>
     )
@@ -329,6 +485,56 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
     if (selectedFriend?.is_typing) return "Typing..."
     if (selectedFriend?.is_online) return "🟢 Online"
     return "⚫ Offline"
+  }
+
+  function formatTime(dateString: string) {
+    return new Date(dateString).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+  }
+
+  function changeWallpaper(value: string) {
+    setWallpaper(value)
+    localStorage.setItem("zuzuchat_wallpaper", value)
+    setShowThemes(false)
+  }
+
+  async function askAI() {
+    if (!profile || !selectedFriend || !newMessage.trim()) return
+
+    setAiLoading(true)
+
+    try {
+      const res = await fetch("/api/ai-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: newMessage.trim() }),
+      })
+
+      const data = await res.json()
+
+      await supabase.from("messages").insert({
+        sender_id: profile.id,
+        receiver_id: selectedFriend.id,
+        message: encryptMessage(`🤖 AI: ${data.reply || "No response"}`),
+        image_url: null,
+        audio_url: null,
+        file_url: null,
+        file_name: null,
+        file_type: null,
+        reply_to_id: replyingTo?.id || null,
+        is_seen: false,
+        is_deleted: false,
+      })
+
+      setNewMessage("")
+      setReplyingTo(null)
+    } catch {
+      alert("AI bot error ❌")
+    } finally {
+      setAiLoading(false)
+    }
   }
 
   return (
@@ -395,46 +601,58 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
         )}
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
-          {friends.map((friend) => (
-            <button
-              key={friend.id}
-              onClick={() => setSelectedFriend(friend)}
-              className="w-full text-left bg-slate-900 rounded-xl p-4 flex items-center justify-between"
-            >
-              <div className="flex items-center gap-3">
-                <img
-                  src={
-                    friend.avatar_url ||
-                    `https://api.dicebear.com/9.x/initials/svg?seed=${friend.name}`
-                  }
-                  alt="avatar"
-                  className="w-11 h-11 rounded-full object-cover"
-                />
+          {friends.map((friend) => {
+            const unread = unreadCounts[friend.id] || 0
 
-                <div>
-                  <h3>{friend.name}</h3>
-                  <p className="text-sm text-slate-400">@{friend.username}</p>
+            return (
+              <button
+                key={friend.id}
+                onClick={() => setSelectedFriend(friend)}
+                className="w-full text-left bg-slate-900 rounded-xl p-4 flex items-center justify-between"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <img
+                    src={
+                      friend.avatar_url ||
+                      `https://api.dicebear.com/9.x/initials/svg?seed=${friend.name}`
+                    }
+                    alt="avatar"
+                    className="w-11 h-11 rounded-full object-cover"
+                  />
+
+                  <div className="min-w-0">
+                    <h3 className="truncate">{friend.name}</h3>
+                    <p className="text-sm text-slate-400 truncate">@{friend.username}</p>
+                  </div>
                 </div>
-              </div>
 
-              <div
-                className={`w-3 h-3 rounded-full ${
-                  friend.is_online ? "bg-green-500" : "bg-slate-600"
-                }`}
-              />
-            </button>
-          ))}
+                <div className="flex items-center gap-2">
+                  {unread > 0 && (
+                    <span className="bg-red-600 text-white text-xs min-w-6 h-6 px-2 rounded-full flex items-center justify-center">
+                      {unread}
+                    </span>
+                  )}
+
+                  <div
+                    className={`w-3 h-3 rounded-full ${
+                      friend.is_online ? "bg-green-500" : "bg-slate-600"
+                    }`}
+                  />
+                </div>
+              </button>
+            )
+          })}
         </div>
       </div>
 
       <div
         className={`${
           selectedFriend ? "flex" : "hidden md:flex"
-        } flex-1 flex-col bg-gradient-to-b from-slate-950 to-black min-w-0`}
+        } flex-1 flex-col bg-gradient-to-b ${wallpaper} min-w-0`}
       >
         {selectedFriend ? (
           <>
-            <div className="h-20 border-b border-slate-800 px-3 md:px-6 flex items-center justify-between">
+            <div className="h-20 border-b border-slate-800 px-3 md:px-6 flex items-center justify-between bg-black/30 backdrop-blur">
               <div className="flex items-center gap-3 min-w-0">
                 <button
                   onClick={() => setSelectedFriend(null)}
@@ -460,85 +678,183 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
                 </div>
               </div>
 
-              <div className="flex gap-2 md:gap-3">
-                <VideoCall
-                  profile={profile}
-                  selectedFriend={selectedFriend}
-                  audioOnly
-                />
-                <VideoCall
-                  profile={profile}
-                  selectedFriend={selectedFriend}
-                />
+              <div className="flex gap-2 md:gap-3 relative">
+                <button
+                  onClick={() => setShowThemes(!showThemes)}
+                  className="bg-slate-800 px-3 py-2 rounded-xl"
+                >
+                  🎨
+                </button>
+
+                {showThemes && (
+                  <div className="absolute top-12 right-0 bg-slate-900 border border-slate-700 rounded-xl p-2 z-50 space-y-2 w-44">
+                    {wallpapers.map((w, index) => (
+                      <button
+                        key={w}
+                        onClick={() => changeWallpaper(w)}
+                        className={`w-full text-left px-3 py-2 rounded-lg bg-gradient-to-r ${w}`}
+                      >
+                        Theme {index + 1}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <VideoCall profile={profile} selectedFriend={selectedFriend} audioOnly />
+                <VideoCall profile={profile} selectedFriend={selectedFriend} />
               </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-3 md:p-6 space-y-4">
-              {messages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`group flex gap-2 ${
-                    msg.sender_id === profile?.id
-                      ? "justify-end"
-                      : "justify-start"
-                  }`}
-                >
-                  {msg.sender_id === profile?.id && !msg.is_deleted && (
-                    <div className="relative">
-                      <button
-                        onClick={() =>
-                          setOpenMenuId(openMenuId === msg.id ? null : msg.id)
-                        }
-                        className="text-slate-400 hover:text-white px-2 py-1 rounded-lg bg-slate-900"
-                      >
-                        ⋮
-                      </button>
+              {messages.map((msg) => {
+                const replied = findReplyMessage(msg.reply_to_id)
 
-                      {openMenuId === msg.id && (
-                        <div className="absolute right-0 top-8 bg-slate-900 border border-slate-700 rounded-xl shadow-xl z-50 min-w-32">
-                          <button
-                            onClick={() => deleteMessage(msg)}
-                            className="w-full text-left px-4 py-3 text-red-400 hover:bg-slate-800 rounded-xl"
-                          >
-                            🗑 Delete
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
+                return (
                   <div
-                    className={`px-4 py-3 rounded-2xl max-w-[80%] ${
-                      msg.is_deleted
-                        ? "bg-slate-900 text-slate-500 italic border border-slate-800"
-                        : msg.sender_id === profile?.id
-                        ? "bg-blue-700"
-                        : "bg-slate-800"
+                    key={msg.id}
+                    className={`group flex ${
+                      msg.sender_id === profile?.id ? "justify-end" : "justify-start"
                     }`}
                   >
-                    {msg.image_url && !msg.is_deleted && (
-                      <img
-                        src={msg.image_url}
-                        alt="chat image"
-                        className="max-w-full md:max-w-xs rounded-xl mb-2"
-                      />
-                    )}
+                    <div
+  className={`flex items-end gap-2 max-w-[85%] md:max-w-md ${
+    msg.sender_id === profile?.id ? "flex-row" : "flex-row-reverse"
+  }`}
+>
+                      {!msg.is_deleted && (
+                        <div className="relative mb-2">
+                          <button
+                            onClick={() =>
+                              setOpenMenuId(openMenuId === msg.id ? null : msg.id)
+                            }
+                            className="text-slate-400 hover:text-white px-2 py-1 rounded-lg bg-slate-900"
+                          >
+                            ⋮
+                          </button>
 
-                    {msg.audio_url && !msg.is_deleted && (
-                      <audio controls src={msg.audio_url} className="mb-2 w-full" />
-                    )}
+                          {openMenuId === msg.id && (
+                            <div className="absolute right-0 bottom-8 bg-slate-900 border border-slate-700 rounded-xl shadow-xl z-50 min-w-36">
+                              <button
+                                onClick={() => startReply(msg)}
+                                className="w-full text-left px-4 py-3 hover:bg-slate-800 rounded-xl"
+                              >
+                                ↩️ Reply
+                              </button>
 
-                    <p className="break-words">{displayMessage(msg)}</p>
+                              {msg.sender_id === profile?.id && msg.message && (
+                                <button
+                                  onClick={() => startEdit(msg)}
+                                  className="w-full text-left px-4 py-3 hover:bg-slate-800 rounded-xl"
+                                >
+                                  ✏️ Edit
+                                </button>
+                              )}
 
-                    <div className="flex justify-end">{renderTicks(msg)}</div>
+                              {msg.sender_id === profile?.id && (
+                                <button
+                                  onClick={() => {
+                                    setOpenMenuId(null)
+                                    deleteMessage(msg)
+                                  }}
+                                  className="w-full text-left px-4 py-3 text-red-400 hover:bg-slate-800 rounded-xl"
+                                >
+                                  🗑 Delete
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <div
+                        className={`px-4 py-3 rounded-2xl ${
+                          msg.is_deleted
+                            ? "bg-slate-900 text-slate-500 italic border border-slate-800"
+                            : msg.sender_id === profile?.id
+                            ? "bg-blue-700"
+                            : "bg-slate-800"
+                        }`}
+                      >
+                        {replied && !msg.is_deleted && (
+                          <div className="mb-2 border-l-4 border-blue-300 pl-2 bg-black/20 rounded p-2 text-xs text-slate-300">
+                            <p className="font-semibold">Replying to</p>
+                            <p className="truncate">
+                              {replied.is_deleted
+                                ? "Deleted message"
+                                : displayMessage(replied) ||
+                                  replied.file_name ||
+                                  (replied.image_url ? "Image" : replied.audio_url ? "Audio" : "")}
+                            </p>
+                          </div>
+                        )}
+
+                        {msg.image_url && !msg.is_deleted && (
+                          <img
+                            src={msg.image_url}
+                            alt="chat image"
+                            className="max-w-full md:max-w-xs rounded-xl mb-2"
+                          />
+                        )}
+
+                        {msg.audio_url && !msg.is_deleted && (
+                          <audio controls src={msg.audio_url} className="mb-2 w-full" />
+                        )}
+
+                        {msg.file_url && !msg.is_deleted && (
+                          <a
+                            href={msg.file_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="block bg-black/30 rounded-xl p-3 mb-2 hover:bg-black/50"
+                          >
+                            📄 {msg.file_name || "Download file"}
+                          </a>
+                        )}
+
+                        <p className="break-words">{displayMessage(msg)}</p>
+
+                        <div className="flex items-center justify-end gap-1 mt-1">
+                          {msg.is_edited && !msg.is_deleted && (
+                            <span className="text-[10px] text-slate-300">edited</span>
+                          )}
+                          <span className="text-[10px] text-slate-300">
+                            {formatTime(msg.created_at)}
+                          </span>
+                          {renderTicks(msg)}
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
 
               <div ref={messagesEndRef} />
             </div>
 
-            <div className="relative p-3 md:p-4 border-t border-slate-800 flex gap-2 md:gap-3">
+            {(replyingTo || editingMsg) && (
+              <div className="px-4 py-2 bg-slate-900 border-t border-slate-800 flex justify-between items-center">
+                <div className="text-sm text-slate-300 truncate">
+                  {editingMsg ? (
+                    <>✏️ Editing: {displayMessage(editingMsg)}</>
+                  ) : (
+                    <>↩️ Replying to: {replyingTo ? displayMessage(replyingTo) || replyingTo.file_name || "Media" : ""}</>
+                  )}
+                </div>
+
+                <button
+                  onClick={() => {
+                    setReplyingTo(null)
+                    setEditingMsg(null)
+                    setNewMessage("")
+                  }}
+                  className="text-red-400 px-3"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            <div className="relative p-3 md:p-4 border-t border-slate-800 flex gap-2 md:gap-3 bg-black/30 backdrop-blur">
               {showEmoji && (
                 <div className="absolute bottom-20 left-2 md:left-4 z-50 scale-90 md:scale-100 origin-bottom-left">
                   <EmojiPicker
@@ -570,20 +886,46 @@ export default function ChatClient({ profile }: { profile: Profile | null }) {
               />
 
               <input
+                ref={fileInputRef}
+                type="file"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  if (file) sendFile(file)
+                  e.target.value = ""
+                }}
+              />
+
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="bg-slate-800 px-3 md:px-4 rounded-xl"
+              >
+                📄
+              </button>
+
+              <input
                 value={newMessage}
                 onChange={(e) => handleTyping(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") sendMessage()
                 }}
-                placeholder="Message..."
+                placeholder={editingMsg ? "Edit message..." : "Message..."}
                 className="min-w-0 flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 md:px-4 py-3 text-white"
               />
+
+              <button
+                onClick={askAI}
+                disabled={aiLoading}
+                className="bg-purple-700 hover:bg-purple-600 px-3 md:px-4 rounded-xl disabled:opacity-50"
+              >
+                🤖
+              </button>
 
               <button
                 onClick={sendMessage}
                 className="bg-blue-700 hover:bg-blue-600 px-4 md:px-6 rounded-xl"
               >
-                Send
+                {editingMsg ? "Save" : "Send"}
               </button>
             </div>
           </>
